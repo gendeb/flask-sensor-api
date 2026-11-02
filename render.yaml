@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: sensor-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # --preload builds the app (and seeds the DB) once, before workers fork
+    startCommand: gunicorn wsgi:app --preload --workers 2 --timeout 60
+    healthCheckPath: /health
+    autoDeploy: true   # redeploy on every push to the connected GitHub branch
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: SEED_READINGS
+        value: "20000"
+      # For persistent data, add a Postgres instance and set DATABASE_URL:
+      # - key: DATABASE_URL
+      #   fromDatabase: { name: sensor-db, property: connectionString }
