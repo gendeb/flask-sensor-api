@@ -62,3 +62,11 @@ def test_create_reading_validation(client):
 def test_stats(client):
     stats = client.get("/api/v1/stats/summary").get_json()
     assert stats["count"] == 500
+
+
+def test_units_are_returned(client):
+    expected = {"temperature": "C", "humidity": "%"}
+    assert client.get("/api/v1/readings?limit=1").get_json()["meta"]["units"] == expected
+    assert client.get("/api/v1/readings/1").get_json()["units"] == expected
+    assert client.get("/api/v1/stats/summary").get_json()["units"] == expected
+    assert client.get("/").get_json()["units"] == expected

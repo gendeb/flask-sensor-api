@@ -1,5 +1,7 @@
 from flask import Blueprint, jsonify
 
+from ..models import UNITS
+
 bp = Blueprint("health", __name__)
 
 
@@ -8,6 +10,7 @@ def index():
     return jsonify(
         service="sensor-api",
         version="v1",
+        units=UNITS,
         endpoints=[
             "GET /health",
             "GET /api/v1/devices",

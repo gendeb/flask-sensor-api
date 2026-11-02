@@ -25,6 +25,8 @@ Client (script, notebook, Spark)  --HTTP/JSON-->  Flask API (Render)  -->  SQLAl
 
 **Data.** The API generates 20,000 synthetic readings at startup (4,000 per device, one per minute), configurable with `SEED_READINGS`.
 
+**Units.** `temperature` is in degrees Celsius and `humidity` is relative humidity in percent (0 to 100). Both are declared once as `UNITS` in `app/models.py` and returned in every response (`meta.units` on lists, `units` on single readings, writes, stats, and the index). The first deployed version did not state units, so a consumer could not tell whether temperatures were Celsius or Fahrenheit. Adding the units as separate metadata, without renaming fields, fixed this without breaking existing clients, which is the kind of backward-compatible change the `/api/v1` contract is meant to allow.
+
 **Endpoints** (prefix `/api/v1`)
 
 | Method | Path | Purpose |
@@ -43,10 +45,11 @@ Client (script, notebook, Spark)  --HTTP/JSON-->  Flask API (Render)  -->  SQLAl
 **Pagination bounds the cost of each request.** `GET /readings` returns 100 rows by default and never more than 1,000 (`MAX_PAGE_SIZE`). Each response includes metadata:
 
 ```json
-{"data": [...], "meta": {"total": 20000, "limit": 100, "offset": 0, "next_offset": 100}}
+{"data": [...], "meta": {"total": 20000, "limit": 100, "offset": 0, "next_offset": 100,
+                         "units": {"temperature": "C", "humidity": "%"}}}
 ```
 
-The client follows `next_offset` until it is `null`. In testing, the client pulled all 20,000 rows in 20 requests of 1,000 rows each, in about 0.2 seconds against a local gunicorn server. If the dataset grew to 20 million rows, the per-request cost would stay the same. Only the number of requests would grow, and a distributed job could split them across workers.
+The client follows `next_offset` until it is `null`. Against the deployed service on Render, the client pulled all 20,000 rows in 20 requests of 1,000 rows each in 5.4 to 5.9 seconds (see Section 8). If the dataset grew to 20 million rows, the per-request cost would stay the same. Only the number of requests would grow, and a distributed job could split them across workers.
 
 **Caching reduces repeated work.** `GET /stats/summary` runs aggregate queries (COUNT, AVG, MIN, MAX) over the whole table. Flask-Caching stores each result for 30 seconds, keyed by query string, so repeated dashboard refreshes do not reach the database. The cache is in memory (`SimpleCache`). Switching to Redis would share it across instances.
 
@@ -78,7 +81,7 @@ This follows the common big-data pattern of separating storage, compute, and acc
 
 - **Automated deployment:** `autoDeploy: true` in `render.yaml` means every push to the connected branch builds and releases the new version.
 - **Health checking:** `/health` is a cheap endpoint that Render uses to confirm the service is up, and an uptime pinger can use it too.
-- **Testing:** 10 pytest tests cover pagination, the page-size cap, filtering, validation, 404 handling, record creation, and aggregates. HTTP-based design makes these tests simple, because they use Flask's test client with no running server.
+- **Testing:** 11 pytest tests cover pagination, the page-size cap, filtering, validation, 404 handling, record creation, aggregates, and the units metadata. HTTP-based design makes these tests simple, because they use Flask's test client with no running server.
 - **Single controlled entry point:** clients never access the database directly. Validation lives in the API (for example, `humidity` must be between 0 and 100, and `device_id` must exist).
 
 ## 7. Problem Found During Testing
@@ -89,11 +92,36 @@ While running the API under gunicorn with 2 workers, the API reported 40,000 rea
 
 **Lesson:** scaling out exposes assumptions that hold with a single process. Startup work such as seeding or migrations must run once, not once per worker. In a larger system, a separate migration step would replace seeding at startup.
 
-## 8. Limitations at Scale
+## 8. Measured Results on Render
+
+The API was deployed to Render's free tier (Oregon region, Python 3, 2 gunicorn workers) at `https://sensor-api-wrmk.onrender.com` and tested from a laptop on 2 November 2026.
+
+**Correctness after deployment.** `GET /api/v1/stats/summary` returned `count: 20000`, with average temperature 17.97 and average humidity 45.02. The count confirms that the `--preload` fix from Section 7 works in production. The two workers seeded the database once.
+
+These measurements were taken before the `units` metadata was added. It adds about 40 bytes per response, which is negligible next to the 9.5 to 95.6 KB list payloads.
+
+**Response times** (5 requests per endpoint, warm service):
+
+| Endpoint | Avg | Min | Max | Payload |
+|---|---|---|---|---|
+| `/health` | 0.330 s | 0.315 s | 0.340 s | 16 B |
+| `/readings?limit=100` | 0.347 s | 0.333 s | 0.368 s | 9.5 KB |
+| `/readings?limit=1000` | 0.463 s | 0.396 s | 0.553 s | 95.6 KB |
+| `/stats/summary` | 0.319 s | 0.307 s | 0.331 s | 110 B |
+
+**Full ingestion** (`client/fetch_all.py`, 3 runs): 20,000 rows in 5.4 s, 5.9 s, and 5.4 s. That is 20 requests of 1,000 rows, about 1.9 MB in total, or roughly 0.27 to 0.30 s per request.
+
+**What the numbers show**
+- **Network round-trip dominates.** An empty `/health` call already costs about 0.33 s. Going from 100 to 1,000 rows (10 times the payload) adds only about 0.12 s. The per-request overhead is much larger than the cost of the data itself, so larger pages are more efficient for bulk pulls, which supports the 1,000-row cap.
+- **Cost scales with the number of pages.** 20 sequential requests take about 5.5 s, so a 10 times larger dataset would take about 55 s sequentially. Fetching pages in parallel (for example from Spark workers, each taking an offset range) is the natural next step.
+- **The stats cache is not visible in these numbers.** `/stats/summary` takes about as long as `/health` because the network latency hides the cost of a 20,000-row aggregate. The cache would matter more with millions of rows or a slower database.
+- **Cold start was not observed.** The service was already awake when tested (first request 0.48 s), so the 30 to 60 s cold start described for the free tier remains a documented limitation, not a measurement. It can be measured by calling the API after more than 15 minutes of inactivity.
+
+## 9. Limitations at Scale
 
 | Limitation | Detail | Mitigation |
 |---|---|---|
-| **Cold starts** | Render's free tier sleeps after about 15 minutes idle. The first request takes 30 to 60 seconds. | The client uses a 90 s timeout. Use a paid plan or a pinger on `/health`. |
+| **Cold starts** | Render's free tier sleeps after about 15 minutes idle. The first request takes 30 to 60 seconds (documented behavior, not measured here). | The client uses a 90 s timeout. Use a paid plan or a pinger on `/health`. |
 | **Ephemeral storage** | SQLite data is lost on restart. The app re-seeds itself. | Use Render Postgres through `DATABASE_URL`. |
 | **Offset pagination** | Deep pages get slower, because the database must skip all earlier rows. | Keyset pagination (`WHERE id > last_id`). |
 | **Synchronous workers** | Concurrency is limited by the worker count. | More workers or instances, or a task queue (Celery, Redis Queue) for long jobs. |
@@ -102,7 +130,7 @@ While running the API under gunicorn with 2 workers, the API reported 40,000 rea
 | **No authentication** | Anyone can call `POST /readings`. | Add API keys or JWT before exposing write endpoints. |
 | **Cache staleness** | `POST /readings` does not clear the stats cache, so stats can be up to 30 s old. | Invalidate on write, or accept short staleness. |
 
-## 9. Summary
+## 10. Summary
 
 | Aspect | How the project demonstrates it |
 |---|---|
@@ -117,9 +145,10 @@ The RESTful Flask approach trades some raw performance for flexibility. The resu
 
 ```bash
 pip install -r requirements.txt
-pytest                                                     # 10 tests pass
+pytest                                                     # 11 tests pass
 gunicorn wsgi:app --preload --workers 2 --bind 127.0.0.1:5055
-python client/fetch_all.py http://127.0.0.1:5055           # fetched 20000 rows in ~0.2 s
+python client/fetch_all.py http://127.0.0.1:5055           # fetched 20000 rows in ~0.2 s (local)
+python client/fetch_all.py https://sensor-api-wrmk.onrender.com   # 5.4 to 5.9 s (Render)
 ```
 
-The 0.2 s figure was measured against a local server. Times against Render will be higher because of network latency, and the first request after idle will include the cold start.
+The local run takes about 0.2 s because there is no network latency. Against Render, each request adds about 0.3 s of round-trip time. The first request after more than 15 minutes of idle time would also include the free-tier cold start.

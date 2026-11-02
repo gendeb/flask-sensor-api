@@ -2,6 +2,10 @@ from datetime import datetime, timezone
 
 from .extensions import db
 
+# Units of the measurement fields. Returned in API responses so consumers
+# never have to guess (temperature is Celsius, humidity is relative humidity %).
+UNITS = {"temperature": "C", "humidity": "%"}
+
 
 class Device(db.Model):
     id = db.Column(db.Integer, primary_key=True)

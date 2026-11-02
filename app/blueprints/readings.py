@@ -1,7 +1,7 @@
 from flask import Blueprint, current_app, jsonify, request
 
 from ..extensions import db
-from ..models import Device, Reading
+from ..models import UNITS, Device, Reading
 
 bp = Blueprint("readings", __name__)
 
@@ -33,13 +33,14 @@ def list_readings():
             "limit": limit,
             "offset": offset,
             "next_offset": next_offset if next_offset < total else None,
+            "units": UNITS,
         },
     )
 
 
 @bp.get("/<int:reading_id>")
 def get_reading(reading_id):
-    return jsonify(db.get_or_404(Reading, reading_id).to_dict())
+    return jsonify(**db.get_or_404(Reading, reading_id).to_dict(), units=UNITS)
 
 
 @bp.post("")
@@ -55,11 +56,11 @@ def create_reading():
     except (TypeError, ValueError):
         return jsonify(error="temperature and humidity must be numbers"), 400
     if not 0 <= humidity <= 100:
-        return jsonify(error="humidity must be between 0 and 100"), 400
+        return jsonify(error="humidity must be between 0 and 100 (%)"), 400
     if db.session.get(Device, body["device_id"]) is None:
         return jsonify(error="unknown device_id"), 404
 
     reading = Reading(device_id=body["device_id"], temperature=temperature, humidity=humidity)
     db.session.add(reading)
     db.session.commit()
-    return jsonify(reading.to_dict()), 201
+    return jsonify(**reading.to_dict(), units=UNITS), 201

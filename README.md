@@ -43,8 +43,18 @@ render.yaml            Render deployment config
 Paginated responses include metadata for the consumer:
 
 ```json
-{"data": [...], "meta": {"total": 20000, "limit": 100, "offset": 0, "next_offset": 100}}
+{"data": [...], "meta": {"total": 20000, "limit": 100, "offset": 0, "next_offset": 100,
+                         "units": {"temperature": "C", "humidity": "%"}}}
 ```
+
+## Units
+
+| Field | Unit |
+|---|---|
+| `temperature` | degrees Celsius (C) |
+| `humidity` | relative humidity, percent (valid range 0 to 100) |
+
+The units are returned in every response (`meta.units` on lists, and `units` on single readings, `POST` responses, stats, and `GET /`), so consumers never have to guess. They are defined once as `UNITS` in `app/models.py`. Field names are unchanged, so existing clients keep working.
 
 ## Run locally
 

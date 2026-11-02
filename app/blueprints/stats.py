@@ -2,7 +2,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import func
 
 from ..extensions import cache, db
-from ..models import Reading
+from ..models import UNITS, Reading
 
 bp = Blueprint("stats", __name__)
 
@@ -27,4 +27,5 @@ def summary():
         count=count,
         temperature={"avg": avg_t and round(avg_t, 2), "min": min_t, "max": max_t},
         humidity={"avg": avg_h and round(avg_h, 2)},
+        units=UNITS,
     )
