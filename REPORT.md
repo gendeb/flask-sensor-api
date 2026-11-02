@@ -81,7 +81,7 @@ This follows the common big-data pattern of separating storage, compute, and acc
 
 - **Automated deployment:** `autoDeploy: true` in `render.yaml` means every push to the connected branch builds and releases the new version.
 - **Health checking:** `/health` is a cheap endpoint that Render uses to confirm the service is up, and an uptime pinger can use it too.
-- **Testing:** 11 pytest tests cover pagination, the page-size cap, filtering, validation, 404 handling, record creation, aggregates, and the units metadata. HTTP-based design makes these tests simple, because they use Flask's test client with no running server.
+- **Testing:** 31 pytest tests cover the API (11 tests: pagination, the page-size cap, filtering, validation, 404 handling, record creation, aggregates, and the units metadata), the analysis (7), the forecasting (8), and the seeded data (5). HTTP-based design makes these tests simple, because they use Flask's test client with no running server.
 - **Single controlled entry point:** clients never access the database directly. Validation lives in the API (for example, `humidity` must be between 0 and 100, and `device_id` must exist).
 
 ## 7. Problem Found During Testing
@@ -96,7 +96,7 @@ While running the API under gunicorn with 2 workers, the API reported 40,000 rea
 
 The API was deployed to Render's free tier (Oregon region, Python 3, 2 gunicorn workers) at `https://sensor-api-wrmk.onrender.com` and tested from a laptop on 2 November 2026.
 
-**Correctness after deployment.** `GET /api/v1/stats/summary` returned `count: 20000`, with average temperature 17.97 and average humidity 45.02. The count confirms that the `--preload` fix from Section 7 works in production. The two workers seeded the database once.
+**Correctness after deployment.** `GET /api/v1/stats/summary` returned `count: 20000`, with average temperature 17.97 and average humidity 45.02 (these averages are from the original random seed, replaced in Section 9.1). The count confirms that the `--preload` fix from Section 7 works in production. The two workers seeded the database once.
 
 These measurements were taken before the `units` metadata was added. It adds about 40 bytes per response, which is negligible next to the 9.5 to 95.6 KB list payloads.
 
@@ -115,13 +115,89 @@ These measurements were taken before the `units` metadata was added. It adds abo
 - **Network round-trip dominates.** An empty `/health` call already costs about 0.33 s. Going from 100 to 1,000 rows (10 times the payload) adds only about 0.12 s. The per-request overhead is much larger than the cost of the data itself, so larger pages are more efficient for bulk pulls, which supports the 1,000-row cap.
 - **Cost scales with the number of pages.** 20 sequential requests take about 5.5 s, so a 10 times larger dataset would take about 55 s sequentially. Fetching pages in parallel (for example from Spark workers, each taking an offset range) is the natural next step.
 - **The stats cache is not visible in these numbers.** `/stats/summary` takes about as long as `/health` because the network latency hides the cost of a 20,000-row aggregate. The cache would matter more with millions of rows or a slower database.
-- **Cold start was not observed.** The service was already awake when tested (first request 0.48 s), so the 30 to 60 s cold start described for the free tier remains a documented limitation, not a measurement. It can be measured by calling the API after more than 15 minutes of inactivity.
+- **Cold start measured.** After 18 minutes with no requests (13:55:39 to 14:13:39), the first request to `/health` took **31.4 s**. The TCP connection took 0.06 s, so almost all of the time was spent waiting while Render woke the service and started gunicorn, including the app's startup work. The next three `/health` calls took 0.31 s, 0.33 s, and 0.30 s, and a 1,000-row page took 0.40 s. The cold request was therefore about 100 times slower than a warm one. This is a single measurement, and it falls at the low end of the 30 to 60 s range documented for the free tier.
 
-## 9. Limitations at Scale
+## 9. Data Analysis and Machine Learning Forecasting
+
+The client side is split into loosely coupled steps that mirror the API's own design:
+
+1. **Load** (`client/sources.py`): returns a pandas DataFrame from the REST API, a local CSV, or a CSV/JSON URL. Nothing downstream knows which source was used, so a new source needs only one new loader function.
+2. **Analyze** (`client/analyze.py`): statistical analysis, described in 9.2.
+3. **Forecast** (`client/forecast.py`): machine learning, described in 9.3.
+
+The user chooses the source and columns on the command line.
+
+### 9.1 Realistic seeded data
+
+The first version of the seed generated independent random numbers. The analysis correctly found nothing in it (no daily pattern, no trend, correlation r = -0.0001, and 0.29% outliers, as expected for noise), which also meant a forecasting model would have had nothing to learn. The seed (`app/seed.py`) was therefore rewritten to follow how real sensor data behaves:
+
+| Component | Model |
+|---|---|
+| Climate by location | Baseline of 15 C plus an offset per device (Aspen -6, Fort Collins -1, Boulder 0, Denver +1, Pueblo +2.5) |
+| Daily cycle | Cosine with an amplitude of 7 C, warmest at 21:00 UTC (about 3 pm in Colorado) |
+| Weather | A slowly drifting value, shared by all devices (autoregressive with 0.98 persistence per hour) |
+| Measurement noise | Gaussian, standard deviation 0.7 C |
+| Humidity | 50% minus 1.8 points per degree above normal, plus noise, limited to 0 to 100 |
+
+The row count (20,000), device count, endpoints, and response format are unchanged. The performance measurements in Section 8 were taken with the earlier random seed, and payload sizes are similar. Five tests (`tests/test_seed.py`) check that the seeded data has a daily cycle, that humidity falls as temperature rises, that Aspen is colder than Boulder and Boulder colder than Pueblo, and that all values are in valid ranges.
+
+### 9.2 Statistical analysis (fetch, then analyze)
+
+`analyze.py` computes averages (overall or per group), the daily pattern (mean by hour of day, and the share of variance the hour explains), the linear trend, anomalies (|z| > 3), and the correlation between two columns.
+
+**Results on the realistic seed** (20,000 readings, local run of the same code):
+
+| Analysis of `temperature` | Result |
+|---|---|
+| Mean per device | Boulder 16.93, Denver 17.94, Fort Collins 15.94, Aspen 10.93, Pueblo 19.43 |
+| Daily pattern | Peak at 20:00 UTC and low at 08:00 UTC. The hour of day explains 70.1% of the variance. |
+| Trend | 0.127 per day (r = 0.08), which is weak and comes from the random weather drift |
+| Anomalies (\|z\| > 3) | 0 of 20,000 rows |
+| Correlation with humidity | r = -0.84 |
+
+**Validation on data with known structure.** The analysis was also run on a generated CSV of 336 hourly prices containing a daily cycle, a rise of 1.2 per day, one planted outlier (140), and a related volume column. It reported a daily pattern (the hour explains 45.8% of variance, peak at 15:00), a slope of 1.19 per day, the single outlier, and a correlation of r = 0.93 with volume.
+
+### 9.3 Machine learning: forecasting
+
+**Task.** Predict the next hour's temperature from recent history. The readings are averaged to one value per hour (335 hourly values from the seeded data).
+
+**Features.** The temperature 1, 2, 3, and 24 hours earlier (recent trend and the same hour yesterday), and the hour of day encoded as a sine and cosine so that 23:00 and 00:00 are close together.
+
+**Models.**
+- **Ridge regression:** a linear model with regularization, on standardized features.
+- **Gradient boosting:** an ensemble of decision trees, which can capture non-linear relationships.
+
+**Evaluation method.**
+- **Time-ordered split.** The models train on the first 80% of the timeline (248 hours) and are scored on the last 20% (63 hours), which they never saw. The data is never shuffled, because shuffling would let the model train on the future.
+- **Baselines.** Each model is compared with three simple predictors: the training mean, "same as the last hour," and "same hour yesterday." A model that cannot beat these has learned nothing useful.
+- **Metrics.** Mean absolute error (MAE) and root mean squared error (RMSE), in degrees Celsius.
+
+**Results** (test period, lower is better):
+
+| Method | MAE | RMSE |
+|---|---|---|
+| **Ridge regression** | **0.485** | **0.593** |
+| Gradient boosting | 0.733 | 0.894 |
+| Baseline: same as last hour | 1.222 | 1.390 |
+| Baseline: same hour yesterday | 1.736 | 2.313 |
+| Baseline: training mean | 4.682 | 5.431 |
+
+Ridge regression's error is 60.3% lower than the best baseline (same as the last hour) and 89.6% lower than predicting the mean. After the evaluation, the best model is refit on all the data and forecasts the next 24 hours, feeding each prediction back in as the next input.
+
+**How to read this honestly**
+- **The data is synthetic.** It was generated from a smooth daily cycle, and a linear model with sine and cosine hour features can represent that exactly, which is why Ridge wins. These results show that the pipeline works and is evaluated fairly. They do not show how well the approach would predict real weather, which is messier.
+- **Gradient boosting is worse here** because 248 training hours is a small sample for a tree ensemble. A more complex model is not automatically better.
+- **The test set is small and a single split** (63 hours), so the exact numbers should not be over-interpreted. Because the seeded timestamps start at deploy time, they also vary slightly between seedings.
+- **Only one-step-ahead accuracy was evaluated.** The 24-hour forecast feeds predictions back in, so its errors accumulate with the horizon, and that accuracy was not measured.
+- **Tests.** Eight tests (`tests/test_forecast.py`) check the feature construction, that the train and test periods never overlap, that the models beat the baselines on cyclic data, and that they do **not** beat the mean baseline on pure noise, which guards against a pipeline that appears to learn when it cannot.
+
+**Scaling limitation.** The analysis and forecasting download all rows to the client and run in pandas and scikit-learn, which works for tens or hundreds of thousands of rows. At much larger volumes, the same steps would run in Spark (with MLlib) over Parquet files in object storage.
+
+## 10. Limitations at Scale
 
 | Limitation | Detail | Mitigation |
 |---|---|---|
-| **Cold starts** | Render's free tier sleeps after about 15 minutes idle. The first request takes 30 to 60 seconds (documented behavior, not measured here). | The client uses a 90 s timeout. Use a paid plan or a pinger on `/health`. |
+| **Cold starts** | Render's free tier sleeps after about 15 minutes idle. After 18 minutes idle, the first request took 31.4 s, against about 0.31 s when warm (measured in Section 8). | The client uses a 90 s timeout. Use a paid plan or a pinger on `/health`. |
 | **Ephemeral storage** | SQLite data is lost on restart. The app re-seeds itself. | Use Render Postgres through `DATABASE_URL`. |
 | **Offset pagination** | Deep pages get slower, because the database must skip all earlier rows. | Keyset pagination (`WHERE id > last_id`). |
 | **Synchronous workers** | Concurrency is limited by the worker count. | More workers or instances, or a task queue (Celery, Redis Queue) for long jobs. |
@@ -130,25 +206,30 @@ These measurements were taken before the `units` metadata was added. It adds abo
 | **No authentication** | Anyone can call `POST /readings`. | Add API keys or JWT before exposing write endpoints. |
 | **Cache staleness** | `POST /readings` does not clear the stats cache, so stats can be up to 30 s old. | Invalidate on write, or accept short staleness. |
 
-## 10. Summary
+## 11. Summary
 
 | Aspect | How the project demonstrates it |
 |---|---|
 | **Scalability** | Stateless design with 2 gunicorn workers, bounded pages (max 1,000 rows), cached aggregates, and a database that can be swapped through one environment variable |
 | **Modularity** | Blueprints per resource, an app factory, separate config/models/seed modules, and `/api/v1` versioning |
 | **Loose coupling** | A pure HTTP/JSON contract lets the client, database, and hosting change independently |
-| **Trade-offs** | Free-tier cold starts, ephemeral storage, offset pagination, and JSON overhead, each with a known mitigation |
+| **Data analysis** | Loadable from the API, a CSV, or a URL. Statistics find a daily cycle (70% of variance) and a humidity correlation (r = -0.84). |
+| **Machine learning** | Ridge regression forecasts the next hour with an error 60% lower than the best baseline, evaluated on a held-out, time-ordered test period |
+| **Trade-offs** | Free-tier cold starts (31.4 s measured), ephemeral storage, offset pagination, and JSON overhead, each with a known mitigation |
 
 The RESTful Flask approach trades some raw performance for flexibility. The result is a system that is easy to grow, change, and integrate, and where bottlenecks can be fixed one component at a time. For much larger volumes, it should be complemented by streaming (Kafka), object storage (S3 with Parquet), and a distributed processing engine (Spark).
 
 ## Appendix: Reproducing the Results
 
 ```bash
-pip install -r requirements.txt
-pytest                                                     # 11 tests pass
+pip install -r requirements-analysis.txt                   # server + analysis + ML dependencies
+pytest                                                     # 31 tests pass
 gunicorn wsgi:app --preload --workers 2 --bind 127.0.0.1:5055
 python client/fetch_all.py http://127.0.0.1:5055           # fetched 20000 rows in ~0.2 s (local)
-python client/fetch_all.py https://sensor-api-wrmk.onrender.com   # 5.4 to 5.9 s (Render)
+python client/analyze.py --api http://127.0.0.1:5055       # statistics
+python client/forecast.py --api http://127.0.0.1:5055      # machine learning forecast
 ```
 
-The local run takes about 0.2 s because there is no network latency. Against Render, each request adds about 0.3 s of round-trip time. The first request after more than 15 minutes of idle time would also include the free-tier cold start.
+`requirements.txt` holds only what the server needs, so Render's build stays small. `requirements-analysis.txt` adds pandas, scikit-learn, and the other client-side tools.
+
+The local pull takes about 0.2 s because there is no network latency. Against Render, each request adds about 0.3 s of round-trip time (Section 8), and the first request after more than 15 minutes idle took 31.4 s because of the free-tier cold start.

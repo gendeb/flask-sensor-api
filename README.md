@@ -23,7 +23,10 @@ app/
     readings.py        paginated list, single read, create
     stats.py           cached aggregates
 client/fetch_all.py    paginated ingestion into pandas / Parquet
-tests/test_api.py      pytest suite
+client/sources.py      step 1: load data from the API, a CSV, or a URL
+client/analyze.py      step 2: averages, patterns, trend, anomalies, correlation
+client/forecast.py     step 3: machine learning forecast, tested against baselines
+tests/                 pytest suites (API and analysis)
 wsgi.py                gunicorn entry point
 render.yaml            Render deployment config
 ```
@@ -60,13 +63,88 @@ The units are returned in every response (`meta.units` on lists, and `units` on 
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-analysis.txt   # server + client analysis/ML (the server alone needs only requirements.txt)
 python wsgi.py                      # dev server on http://127.0.0.1:5000
 # or, like production:
 gunicorn wsgi:app --preload --workers 2
 pytest                              # run the tests
 python client/fetch_all.py http://127.0.0.1:5000 --out readings.parquet
 ```
+
+## Analyze data (fetch, then analyze)
+
+Analysis is two steps. **Step 1** loads data from a source you choose into pandas (`client/sources.py`). **Step 2** analyzes it (`client/analyze.py`).
+
+```bash
+# This project's API (local or deployed)
+python client/analyze.py --api https://sensor-api-wrmk.onrender.com
+
+# Your own CSV file: say which columns to use
+python client/analyze.py --csv mydata.csv --value price --time date --group city --other volume
+
+# A CSV or JSON file on the web
+python client/analyze.py --url https://example.com/data.csv --value sales
+```
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--api` / `--csv` / `--url` | Where to load data from (pick one) | required |
+| `--value` | Numeric column to analyze | `temperature` |
+| `--time` | Timestamp column (enables daily pattern and trend) | `ts` |
+| `--group` | Category column (summary per group) | `device_id` |
+| `--other` | Second numeric column to correlate with `--value` | `humidity` |
+
+If a column doesn't exist, that analysis is skipped. If `--value` doesn't exist, the script lists the available columns.
+
+**What it reports**
+
+| Analysis | How |
+|---|---|
+| Averages | count, mean, median, std, min, max, overall or per group |
+| Daily pattern | mean by hour of day. A pattern is reported if hour of day explains more than 5% of the variance. |
+| Trend | linear slope per day, with the correlation `r` |
+| Anomalies | rows more than 3 standard deviations from the mean |
+| Correlation | Pearson `r` between `--value` and `--other` |
+
+**Reading the results on the sample data.** The API's 20,000 readings are generated to behave like real sensors (see below), so the analysis finds a daily cycle (hour of day explains about 70% of the temperature variance, warmest around 20:00 UTC), humidity that falls as temperature rises (r of about -0.84), and temperatures that differ by location (Aspen is coldest, Pueblo warmest). On pure random noise, the same script correctly reports no pattern.
+
+### Seeded data
+
+`app/seed.py` generates temperature as a location baseline + a daily cycle (warmest about 3 pm local time) + slowly drifting weather shared by all devices + measurement noise. Humidity falls as temperature rises. Timestamps are UTC. The row count, devices, and endpoints are unchanged (20,000 readings, 5 devices).
+
+## Forecast (machine learning)
+
+`client/forecast.py` predicts the next hour of a value and, more importantly, **tests whether the models really help**.
+
+```bash
+python client/forecast.py --api https://sensor-api-wrmk.onrender.com
+python client/forecast.py --api http://127.0.0.1:5000 --where device_id=1 --steps 12
+python client/forecast.py --csv mydata.csv --value price --time date
+```
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--api` / `--csv` / `--url` | Where to load data from (pick one) | required |
+| `--value` | Numeric column to forecast | `temperature` |
+| `--time` | Timestamp column | `ts` |
+| `--where COL=VALUE` | Keep only rows where a column equals a value, e.g. one device | all rows |
+| `--steps` | Hours to forecast | `24` |
+
+**Method.** The data is averaged to one value per hour. Features are the value 1, 2, 3, and 24 hours earlier, plus the hour of day (as sine and cosine). Two models are trained, Ridge regression and Gradient boosting, on the first 80% of the timeline and scored on the last 20%, which they never saw (a time-ordered split, never shuffled). Their error (MAE, RMSE) is compared with three baselines: the training mean, "same as the last hour," and "same hour yesterday." The script says plainly when a model fails to beat the best baseline. The best model is then refit on all the data and forecasts the next `--steps` hours.
+
+**Example result on the sample data** (local run, test period of 63 hours):
+
+| Method | MAE |
+|---|---|
+| Ridge regression | 0.485 |
+| Gradient boosting | 0.733 |
+| Baseline: same as last hour | 1.222 |
+| Baseline: same hour yesterday | 1.736 |
+| Baseline: training mean | 4.682 |
+
+Ridge is 60% better than the best baseline. Because the sample data is synthetic and built from a smooth daily cycle, this shows that the pipeline works and is evaluated fairly, not how well it would predict real weather. Exact numbers vary slightly between runs because the seeded timestamps start when the app starts. At least 72 hourly values are needed.
+
+Add a new source by writing a `load_*` function in `client/sources.py` that returns a DataFrame.
 
 ## Deploy to Render
 
